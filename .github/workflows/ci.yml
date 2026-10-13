@@ -1,0 +1,53 @@
+﻿name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Check every script compiles
+        run: python -m compileall -q .
+      - name: Run tests
+        run: pytest tests -v --tb=short
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check .
+
+  guard-large-files:
+    name: No datasets or audio committed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject audio and oversized files
+        run: |
+          set -e
+          offenders=$(git ls-files | grep -Ei '\.(wav|mp3|flac|m4a)$' || true)
+          if [ -n "$offenders" ]; then
+            echo "Audio files must not be committed:"; echo "$offenders"; exit 1
+          fi
+          echo "no audio committed"
