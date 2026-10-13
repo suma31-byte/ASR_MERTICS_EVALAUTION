@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A new push supersedes the run in flight for the same branch.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest version the code supports, and the newest it is run on.
+        # The `X | Y` union syntax used in the scripts needs 3.10 or later.
+        python: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Check every script imports and parses
+        # A syntax error or a missing import in a script with no tests would
+        # otherwise only surface on the test machine, mid-run.
+        run: |
+          python -m compileall -q .
+          python - <<'PY'
+          import ast, pathlib, sys
+          bad = []
+          for f in sorted(pathlib.Path(".").glob("*.py")):
+              try:
+                  ast.parse(f.read_text(encoding="utf-8"))
+              except SyntaxError as e:
+                  bad.append(f"{f}: {e}")
+          print("\n".join(bad) if bad else "all scripts parse")
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Run tests
+        # No phone and no sound card on a runner: the audio layer is stubbed in
+        # tests/conftest.py, so everything that does not need hardware - the
+        # normaliser, the metrics, manifest loading, the safety guards - is
+        # covered here. The device-dependent paths are verified by the
+        # calibration run described in the README.
+        run: pytest tests -v --tb=short
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install ruff
+      - name: Ruff
+        # Errors fail the build; style opinions do not. See ruff.toml.
+        run: ruff check .
+
+  guard-large-files:
+    name: No datasets or audio committed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject audio and dataset files
+        # The corpus is ~5.4 GB. Once a large file is in the history it stays
+        # there, and every future clone pays for it - so this is blocked at the
+        # pull request rather than cleaned up afterwards.
+        run: |
+          set -e
+          offenders=$(git ls-files | grep -Ei '\.(wav|mp3|flac|m4a)$' || true)
+          if [ -n "$offenders" ]; then
+            echo "Audio files must not be committed:"; echo "$offenders"; exit 1
+          fi
+          big=$(git ls-files | xargs -r -I{} sh -c 'f="{}"; s=$(wc -c <"$f"); [ "$s" -gt 5242880 ] && echo "$f ($((s/1048576)) MB)"' || true)
+          if [ -n "$big" ]; then
+            echo "Files over 5 MB must not be committed:"; echo "$big"; exit 1
+          fi
+          echo "no audio or oversized files"

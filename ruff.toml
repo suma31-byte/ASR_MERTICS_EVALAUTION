@@ -1,0 +1,18 @@
+# Real errors fail the build. Line length and import order are opinions, and
+# a build that fails on them trains people to ignore the build.
+line-length = 100
+target-version = "py310"
+
+[lint]
+select = ["E4", "E7", "E9", "F", "B"]   # pyflakes, bugbear, real syntax errors
+ignore = [
+    "E501",    # long lines: several are URLs and explanatory comments
+    "B008",    # function call in default argument: used deliberately for paths
+    "E701",    # one-line if/return in the small label_* lookup functions
+    "E741",    # a loop variable named l in a list comprehension
+    "B904",    # raise-from inside blocks that deliberately replace the error
+               # with a readable one for the operator
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["B011"]

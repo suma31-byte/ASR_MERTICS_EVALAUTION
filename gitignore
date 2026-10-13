@@ -1,0 +1,54 @@
+# ── Never commit the dataset or the audio ────────────────────────────────
+# The corpus is ~5.4 GB of wav files and the manifests run to tens of
+# thousands of rows. GitHub rejects files over 100 MB and a repository this
+# size becomes unusable to clone. Keep the audio on shared storage and the
+# manifests wherever your team keeps data; the scripts find them by path.
+combined/
+dataset/
+audio/
+*.wav
+*.mp3
+*.flac
+dataset_v*.csv
+metadata*.csv
+manifest*.csv
+
+# ── Run output ───────────────────────────────────────────────────────────
+results_detailed*.csv
+full_metrics_*.csv
+batch_results_*.csv
+report_*.xlsx
+summary*.json
+smartscribe_asr_eval_*.txt
+batch_*_size*.txt
+status.json
+status.json.tmp
+stop.request
+run.log
+run_*.json
+
+# ── Local machine state ──────────────────────────────────────────────────
+calibration.json
+calibration_screenshot.png
+_window_dump.xml
+ui_map.json
+eval_out/
+audio_cache/
+
+# ── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# ── Editors and OS ───────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
