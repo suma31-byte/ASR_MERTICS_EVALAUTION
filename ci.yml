@@ -60,6 +60,26 @@ jobs:
         # calibration run described in the README.
         run: pytest tests -v --tb=short
 
+      - name: Evaluate 10 samples end to end
+        # The tests prove each piece works; this proves they are still
+        # connected. Ten samples with deliberately corrupted transcripts go
+        # through the real harness against a stand-in for the app, and the
+        # metrics must come out as the corruptions dictate. A pipeline that
+        # plays audio before recording starts, or scores the live text instead
+        # of the transcript button, passes every unit test and fails here.
+        run: python ci_smoke_run.py
+
+      - name: Keep the run output
+        # The CSV and the Excel report from that run, downloadable from the
+        # workflow summary - so a failure can be opened rather than guessed at.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-run-python-${{ matrix.python }}
+          path: ci_output/
+          if-no-files-found: ignore
+          retention-days: 14
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
