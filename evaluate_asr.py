@@ -764,19 +764,64 @@ def _bounds_center(bounds: str) -> tuple[int, int]:
 ANALYSIS_MODES = {
     "speaker": {"labels": ["SPEAKER ANALYSIS"],
                 "fields": ["standardizedText"]},
-    # The transcript button may write a new field, or it may simply display
-    # text the app already saved when recording stopped. In the second case
-    # nothing changes after the press, so waiting for a change would hang. Here
-    # the saved transcript is accepted as the answer once the grace period
-    # passes without a new field appearing.
-    "transcript": {"labels": ["TRANSCRIPT", "TRANSCRIPTION", "FULL TRANSCRIPT",
-                              "GET TRANSCRIPT", "SHOW TRANSCRIPT"],
-                   "fields": ["transcriptText", "fullTranscript", "refinedText",
-                              "standardizedText"],
-                   "fallback_field": "text",
-                   "grace_s": 25.0},
+    # TRANSCRIPT is the button; TRANSCRIPTION is the header above the live
+    # text the app writes while recording. They are one letter apart and the
+    # live text is NOT what this mode measures, so "TRANSCRIPTION" is kept out
+    # of the labels and `text` is never accepted as the result. The field the
+    # button writes is discovered by diffing the saved entry before and after
+    # the press; if the app does not persist it, the text under the TRANSCRIPT
+    # header is read off the screen instead.
+    "transcript": {"labels": ["TRANSCRIPT"],
+                   "fields": []},
 }
-ANALYSIS_MODE = "speaker"          # overridden by --analysis
+
+# Stored fields that are NOT the TRANSCRIPT button's output. `text` is the live
+# transcription: scoring it would silently measure the wrong thing and look
+# like a perfectly good result.
+NOT_TRANSCRIPT_FIELDS = {"id", "timestamp", "text", "standardizedText", "summary",
+                         "refinedText", "title", "duration", "audioPath", "path",
+                         "date"}
+_announced_field: set[str] = set()
+
+
+def pick_new_field(before: dict, after: dict) -> str | None:
+    """Which stored field did the button just fill in or change?"""
+    if ANALYSIS_MODE == "speaker":
+        names = analysis_fields()
+    else:
+        names = [k for k in after if k not in NOT_TRANSCRIPT_FIELDS]
+    for k in names:
+        v = after.get(k)
+        if isinstance(v, str) and v.strip() and v.strip() != str(before.get(k) or "").strip():
+            return k
+    return None
+
+
+def read_transcript_from_ui(serial: str | None) -> str:
+    """Text under the TRANSCRIPT section header, read off the screen.
+
+    The header is not clickable; the button is. That is how the two are told
+    apart. Returns "" if the section is absent or empty.
+    """
+    try:
+        root = dump_ui_xml(serial)
+    except Exception:
+        return ""
+    parents = {c: p for p in root.iter() for c in p}
+
+    def has_clickable(n):
+        while n is not None and n.get("clickable") != "true":
+            n = parents.get(n)
+        return n is not None
+
+    items = [(n, (n.get("text") or "").strip()) for n in root.iter("node")
+             if (n.get("text") or "").strip()]
+    for i, (n, t) in enumerate(items):
+        if re.sub(r"\s+", " ", t).upper() == "TRANSCRIPT" and not has_clickable(n):
+            for _, t2 in items[i + 1:]:
+                return "" if t2.strip().upper() in ("AI SUMMARY", "SUMMARY") else t2
+    return ""
+ANALYSIS_MODE = "transcript"       # overridden by --analysis
 
 
 def analysis_labels() -> list[str]:
@@ -787,48 +832,51 @@ def analysis_fields() -> list[str]:
     return ANALYSIS_MODES[ANALYSIS_MODE]["fields"]
 
 
-def analysis_fallback() -> str | None:
-    """Field to accept unchanged if the button produced nothing new."""
-    return ANALYSIS_MODES[ANALYSIS_MODE].get("fallback_field")
 
-
-def analysis_grace() -> float:
-    """How long to wait for a new field before using the fallback."""
-    return float(ANALYSIS_MODES[ANALYSIS_MODE].get("grace_s", 0.0))
 
 
 def find_analysis_button_xy(serial: str | None,
                             labels: list[str] | None = None) -> tuple[int, int]:
-    """Centre of the button that produces the text we score."""
-    labels = [lab.strip().upper() for lab in (labels or analysis_labels())]
+    """Centre of the button that produces the text we score.
+
+    Only a genuinely clickable element can match, and the TRANSCRIPTION header
+    above the live text is excluded so it can never be tapped by mistake - it
+    sits directly above the TRANSCRIPT button and differs by one letter.
+    """
+    wanted = [lab.strip().upper() for lab in (labels or analysis_labels())]
     root = dump_ui_xml(serial)
-    parent_map = {child: parent for parent in root.iter() for child in parent}
-    target = None
-    for wanted in labels:                      # exact first, then contains
+    parents = {c: p for p in root.iter() for c in p}
+
+    def clickable_ancestor(n):
+        while n is not None and n.get("clickable") != "true":
+            n = parents.get(n)
+        return n
+
+    for exact in (True, False):                # exact match first, then contains
         for node in root.iter("node"):
-            if node.get("text", "").strip().upper() == wanted:
-                target = node
-                break
-        if target is not None:
-            break
-    if target is None:
-        for node in root.iter("node"):
-            label = (node.get("text", "") + " " + node.get("content-desc", "")).strip().upper()
-            if label and any(w in label for w in labels):
-                target = node
-                break
-    if target is None:
-        raise RuntimeError(
-            f"Could not find a {' or '.join(labels)} button on screen. "
-            "Make sure the app is on the home (RECORD & VAD) tab and not "
-            "mid-recording or mid-analysis."
-        )
-    node = target
-    while node is not None and node.get("clickable") != "true":
-        node = parent_map.get(node)
-    if node is None:
-        raise RuntimeError(f"Found {labels[0]} text but no clickable ancestor.")
-    return _bounds_center(node.get("bounds"))
+            label = re.sub(r"\s+", " ", (node.get("text", "") + " " +
+                                         node.get("content-desc", "")).strip().upper())
+            if not label or label == "TRANSCRIPTION":
+                continue
+            hit = (label in wanted) if exact else any(w in label for w in wanted)
+            if not hit:
+                continue
+            btn = clickable_ancestor(node)
+            if btn is not None and btn.get("bounds"):
+                return _bounds_center(btn.get("bounds"))
+
+    visible = []
+    for node in root.iter("node"):
+        label = re.sub(r"\s+", " ", (node.get("text", "") or "").strip())
+        if label and node.get("clickable") == "true" and len(label) < 40:
+            if label not in visible:
+                visible.append(label)
+    raise RuntimeError(
+        f"Could not find a clickable {' / '.join(wanted)} button on screen. "
+        + (f"Buttons visible now: {', '.join(visible[:12])}. " if visible
+           else "No clickable buttons were visible. ")
+        + "Is the session-detail screen open, and not mid-recording?"
+    )
 
 
 def find_speaker_analysis_xy(serial: str | None) -> tuple[int, int]:
@@ -957,6 +1005,53 @@ def open_ble_scan(serial: str | None) -> bool:
 # works across phones without manual setup.
 
 
+def _find_mic_by_shape(root, screen_w: int) -> tuple[int, int]:
+    """Locate the mic button with no anchor to measure from.
+
+    Size is given as a fraction of screen width, not in pixels, so this holds
+    from a 720p phone to a 1440p one.
+    """
+    screen_node = next(root.iter("node"), None)
+    nums = [int(n) for n in re.findall(r"-?\d+", screen_node.get("bounds", ""))] \
+        if screen_node is not None else []
+    screen_h = (nums[3] - nums[1]) if len(nums) == 4 else 2400
+
+    min_w, max_w = 0.12 * screen_w, 0.40 * screen_w
+    candidates = []
+    for node in root.iter("node"):
+        if node.get("clickable") != "true":
+            continue
+        b = [int(n) for n in re.findall(r"-?\d+", node.get("bounds", ""))]
+        if len(b) != 4:
+            continue
+        x1, y1, x2, y2 = b
+        w, h = x2 - x1, y2 - y1
+        if w <= 0 or h <= 0:
+            continue
+        if not (0.7 <= w / h <= 1.4):          # square-ish, not a row
+            continue
+        if not (min_w <= w <= max_w):
+            continue
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        if cy < screen_h * 0.35:               # the mic sits low on the screen
+            continue
+        if abs(cx - screen_w // 2) > screen_w * 0.25:   # and near the centre
+            continue
+        candidates.append((abs(cx - screen_w // 2), cx, cy))
+
+    if not candidates:
+        raise RuntimeError(
+            "Could not locate the mic button: no square clickable element was "
+            "found low and centre on the screen, and no analysis button was "
+            "visible to measure from. Run `python evaluate_asr.py calibrate`, "
+            "read the button's centre off the screenshot, then "
+            "`python evaluate_asr.py set-mic-xy X Y`."
+        )
+    candidates.sort()                           # closest to centre wins
+    _, cx, cy = candidates[0]
+    return cx, cy
+
+
 def find_mic_xy(serial: str | None) -> tuple[int, int]:
     root = dump_ui_xml(serial)
     parent_map = {child: parent for parent in root.iter() for child in parent}
@@ -983,11 +1078,12 @@ def find_mic_xy(serial: str | None) -> tuple[int, int]:
         if sa_text_node is not None:
             break
     if sa_text_node is None:
-        raise RuntimeError(
-            f"Could not find any of {', '.join(anchors[:4])} on screen to anchor "
-            "mic-button detection. Make sure the app is on the home "
-            "(RECORD & VAD) tab, not mid-recording or mid-analysis."
-        )
+        # No analysis button on this screen to measure from. On builds where
+        # those buttons live on the session-detail screen there never will be
+        # one, so fall back to the shape of the thing itself: the mic button is
+        # the roughly-square clickable element low and centre on the record
+        # screen. Everything else there is a wide row or a tab.
+        return _find_mic_by_shape(root, screen_w)
     sa_node = sa_text_node
     while sa_node is not None and sa_node.get("clickable") != "true":
         sa_node = parent_map.get(sa_node)
@@ -1985,61 +2081,60 @@ def process_sample(row: dict, mic_xy: tuple[int, int], serial: str | None) -> di
 
     t_analysis = time.monotonic()
     sa_xy = find_analysis_button_xy(serial)
+
+    # Snapshot before pressing, so whatever the button adds can be told apart
+    # from what was already there - the live text, an empty transcript box.
+    before_entry = dict(saved)
+    before_ui = read_transcript_from_ui(serial) if ANALYSIS_MODE == "transcript" else ""
     tap(*sa_xy, serial=serial)
 
-    before_fields = {f: (saved.get(f) or "").strip() for f in analysis_fields()}
+    last_ui = [0.0]
 
     def _analysis_done():
         entry = find_entry(read_history(serial), new_id)
-        if not entry:
-            return None
-        for field in analysis_fields():
-            value = (entry.get(field) or "").strip()
-            # "text" already holds the live transcript, so it only counts as a
-            # result if pressing the button actually changed it.
-            if value and value != before_fields.get(field, ""):
-                entry["_analysis_field"] = field
-                return entry
+        if entry:
+            field = pick_new_field(before_entry, entry)
+            if field:
+                return {"field": field, "value": entry[field]}
+        # Not persisted to history.json? Read it off the screen instead.
+        if ANALYSIS_MODE == "transcript" and time.monotonic() - last_ui[0] >= 2.5:
+            last_ui[0] = time.monotonic()
+            ui = read_transcript_from_ui(serial)
+            if ui and ui != before_ui:
+                return {"field": "ui_transcript", "value": ui}
         return None
 
-    wait_for = ANALYSIS_TIMEOUT_S
-    fallback = analysis_fallback()
-    if fallback and analysis_grace():
-        wait_for = min(ANALYSIS_TIMEOUT_S, analysis_grace())
-
-    final_entry = poll_until(_analysis_done, timeout=wait_for, serial=serial,
-                             abort_if=_abort_reason)
-
-    if final_entry is None and fallback:
-        # Nothing new appeared. If the app already holds a transcript for this
-        # session, that is what the button was showing, so score it rather than
-        # time out on a result that was there all along.
-        entry = find_entry(read_history(serial), new_id) or {}
-        existing = (entry.get(fallback) or "").strip()
-        if existing:
-            entry["_analysis_field"] = fallback
-            final_entry = entry
-            result["app_message"] = (f"no new field after {wait_for:.0f}s; "
-                                     f"scored the saved {fallback}")
+    found = poll_until(_analysis_done, timeout=ANALYSIS_TIMEOUT_S, serial=serial,
+                       abort_if=_abort_reason)
     result["speaker_analysis_s"] = round(time.monotonic() - t_analysis, 1)
-    if isinstance(final_entry, PollAborted):
-        result["status"] = final_entry.reason
-        result["app_message"] = final_entry.reason
+
+    if isinstance(found, PollAborted):
+        result["status"] = found.reason
+        result["app_message"] = found.reason
         close_session_overlay(serial)
         return result
-    if final_entry is None:
+    if found is None:
+        # Deliberately no fallback to the live `text`: scoring that would
+        # measure the wrong output and look like a valid result.
         result["status"] = "analysis_timeout"
-        result["app_message"] = (f"no labelled text after "
+        result["app_message"] = (f"no {ANALYSIS_MODE} output after "
                                  f"{result['speaker_analysis_s']:.0f}s")
         close_session_overlay(serial)
         return result
 
-    field = final_entry.get("_analysis_field") or analysis_fields()[0]
+    field = found["field"]
+    if field not in _announced_field:
+        _announced_field.add(field)
+        print(f"  [{ANALYSIS_MODE}] output detected in: {field}")
+
     result["analysis_field"] = field
-    result["raw_hypothesis"] = final_entry.get(field) or ""
-    # Speaker labels come off whichever field produced the text: the measure is
-    # transcription accuracy, so a diarisation split must not cost words.
-    result["hypothesis"] = strip_speaker_labels(result["raw_hypothesis"])
+    result["raw_hypothesis"] = found["value"]
+    if ANALYSIS_MODE == "speaker":
+        # Speaker labels come off: the measure is transcription accuracy, so a
+        # diarisation split must not cost words.
+        result["hypothesis"] = strip_speaker_labels(found["value"])
+    else:
+        result["hypothesis"] = re.sub(r"\s+", " ", found["value"]).strip()
     close_session_overlay(serial)
     return result
 
@@ -2542,6 +2637,7 @@ def cmd_run(serial: str | None, limit: int | None, start: int,
                        f"{detail}\n\n"
                        f"{len(done)} samples are saved in {RESULTS_CSV.name}.\n"
                        f"Reconnect the microphone and re-run with --resume.")
+                build_report(RESULTS_CSV)
                 return
             RUN_META["ble_connected"] = True
             RUN_META["ble_detail"] = detail
@@ -2583,6 +2679,7 @@ def cmd_run(serial: str | None, limit: int | None, start: int,
             write_status("paused", done, len(rows), None, started_at)
             print(f"\nInterrupted. {len(done)} samples are saved in {RESULTS_CSV.name}; "
                   "re-run with --resume to carry on from here.")
+            build_report(RESULTS_CSV)
             return
         except Exception as e:
             result = blank_result(row, status=f"error:{e}")
@@ -2616,7 +2713,7 @@ def cmd_run(serial: str | None, limit: int | None, start: int,
                    f"{e}\n\nThe run stopped at sample {i} rather than scoring "
                    "samples that are not being recorded. Free some space, then "
                    "re-run to continue.")
-            return
+            return   # no report: the results file itself could not be written
         done = [r for r in done if r.get("id") != result["id"]] + [result]
 
         if result["hypothesis"].strip():
@@ -2653,6 +2750,7 @@ def cmd_run(serial: str | None, limit: int | None, start: int,
                 print("\nThree failures in a row -- pausing. The phone has most likely "
                       "stopped hearing the speaker, locked, or lost adb.\n"
                       "Fix it, then re-run with --resume.")
+                build_report(RESULTS_CSV)
                 return
         else:
             consecutive_failures = 0
@@ -2700,10 +2798,9 @@ def main() -> None:
     p_run.add_argument("--dba", default=None, help="Level measured at the phone, in dBA")
     p_run.add_argument("--no-dashboard", action="store_true",
                        help="Do not start the live dashboard with this run")
-    p_run.add_argument("--analysis", choices=sorted(ANALYSIS_MODES), default="speaker",
-                       help="which button produces the text to score: 'speaker' "
-                            "taps SPEAKER ANALYSIS, 'transcript' taps the "
-                            "TRANSCRIPT button")
+    p_run.add_argument("--analysis", choices=sorted(ANALYSIS_MODES), default="transcript",
+                       help="which button's output to score: 'transcript' (default) "
+                            "taps TRANSCRIPT, 'speaker' taps SPEAKER ANALYSIS")
     p_run.add_argument("--show-dashboard", action="store_true",
                        help="Always open a dashboard window, even if one is already open")
 
@@ -2727,7 +2824,7 @@ def main() -> None:
         cmd_set_mic_xy(args.x, args.y)
     elif args.command == "run":
         global ANALYSIS_MODE
-        ANALYSIS_MODE = getattr(args, "analysis", "speaker")
+        ANALYSIS_MODE = getattr(args, "analysis", "transcript")
         print(f"Scoring the output of the "
               f"{'TRANSCRIPT' if ANALYSIS_MODE == 'transcript' else 'SPEAKER ANALYSIS'} button.")
         cmd_run(args.serial, args.limit, args.start,

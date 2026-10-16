@@ -11,13 +11,12 @@ Produces one workbook with two sheets:
               plus WER by category and the failure breakdown
   Per sample  one row per sample: id, category, reference, ASR output, metrics
 
-Two averages are reported, because they answer different questions and they do
-not agree. The corpus average, sum of all errors over sum of all reference
-words, is the headline: it weights every word equally and is the figure used in
-published ASR benchmarks. The per-sample average is the mean of the individual
-WER percentages, which lets a three-word sentence count as much as a thirty-word
-one. Showing only the second is how a run full of short samples ends up
-reporting a number nobody can reproduce.
+WER and CER are per-sample averages: the mean of each sample's own percentage.
+Worth knowing what that means when the numbers are quoted - a three-word
+sentence counts as much as a thirty-word one, so a run full of short samples
+reads differently from one of long ones. The corpus-level figure (all errors
+over all reference words) is still computed in `summarise` if it is ever wanted
+back in the report.
 
 Failed and empty samples are counted but never averaged - a sample that
 produced no transcript is not a sample the recogniser got wrong.
@@ -29,11 +28,13 @@ import argparse
 import csv
 import json
 import re
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
 import openpyxl
 from openpyxl.chart import BarChart, Reference
+from openpyxl.chart.label import DataLabelList
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -153,12 +154,17 @@ def header(ws, row: int, labels: list[str], widths: list[int]) -> None:
 
 
 def write_summary(ws, s: dict, meta: dict, results: Path) -> None:
+    """Summary sheet: tables down the left, the chart to the right, and the
+    values the chart plots parked out of sight in columns R and S."""
     ws.sheet_view.showGridLines = False
     ws["A1"] = "SmartScribe ASR evaluation - summary"
     ws["A1"].font = TITLE
     ws["A2"] = (f"{results.name}   |   {s['scored']} samples scored, "
                 f"{s['failed']} failed, {s['total']} attempted")
     ws["A2"].font = SUB
+
+    for col, width in zip("ABCD", (30, 14, 62, 12), strict=False):
+        ws.column_dimensions[col].width = width
 
     # ── run record ────────────────────────────────────────────────────────
     row = 4
@@ -177,14 +183,12 @@ def write_summary(ws, s: dict, meta: dict, results: Path) -> None:
 
     # ── headline figures ──────────────────────────────────────────────────
     row += 1
-    header(ws, row, ["Metric", "Value", "Meaning"], [26, 12, 62])
+    header(ws, row, ["Metric", "Value", "Meaning"], [30, 14, 58])
     row += 1
-    figures = [
-        ("WER % (corpus)", s["wer_micro"],
-         "All errors divided by all reference words. The headline figure."),
-        ("WER % (per sample)", s["wer_macro"],
-         "Mean of the individual sample WERs. Short samples count as much as long ones."),
-        ("CER % (per sample)", s["cer_macro"], "Character error rate, averaged per sample."),
+    for label, value, meaning in [
+        ("Average WER %", s["wer_macro"],
+         "Mean of the individual sample WERs."),
+        ("Average CER %", s["cer_macro"], "Character error rate, averaged per sample."),
         ("SER %", s["ser"], "Share of samples with at least one error."),
         ("Substitutions", s["substitutions"], "Reference word replaced by a different word."),
         ("Deletions", s["deletions"], "Reference word missing from the output."),
@@ -192,106 +196,70 @@ def write_summary(ws, s: dict, meta: dict, results: Path) -> None:
         ("Reference words", s["reference_words"], "Total words scored against."),
         ("Samples scored", s["scored"], "Excludes failed and empty samples."),
         ("Samples failed", s["failed"], "Counted, never averaged into accuracy."),
-    ]
-    for label, value, meaning in figures:
+    ]:
         ws.cell(row=row, column=1, value=label).font = BODY
         cell = ws.cell(row=row, column=2, value=value)
         cell.font = BOLD
         cell.number_format = "0.00" if isinstance(value, float) else "0"
-        ws.cell(row=row, column=3, value=meaning).font = SUB
+        cell.alignment = Alignment(horizontal="right")
+        meaning_cell = ws.cell(row=row, column=3, value=meaning)
+        meaning_cell.font = SUB
+        meaning_cell.alignment = Alignment(vertical="center", wrap_text=False)
         for c in range(1, 4):
             ws.cell(row=row, column=c).border = BORDER
         row += 1
-    metrics_bottom = row - 1
 
-    # ── chart data, kept out of the way to the right ──────────────────────
-    data_col = 8
-    ws.cell(row=4, column=data_col, value="Error rates").font = BOLD
-    rates = [("WER (corpus)", s["wer_micro"]), ("WER (per sample)", s["wer_macro"]),
-             ("CER", s["cer_macro"]), ("SER", s["ser"])]
-    for i, (name, value) in enumerate(rates, start=5):
-        ws.cell(row=i, column=data_col, value=name)
-        ws.cell(row=i, column=data_col + 1, value=value)
+    # ── the chart and the values behind it ────────────────────────────────
+    # The source values sit in columns R and S of this sheet rather than on a
+    # separate tab. Excel will not plot data from a hidden sheet - the first
+    # thing it drops is the category labels under the bars - and a visible
+    # extra tab is clutter. Out at column R they are off-screen and harmless.
+    src_label, src_value = 18, 19          # columns R and S
+    ws.cell(row=3, column=src_label, value="Measure").font = BOLD
+    ws.cell(row=3, column=src_value, value="Value").font = BOLD
 
-    counts_top = 11
-    ws.cell(row=counts_top, column=data_col, value="Error counts").font = BOLD
-    for i, (name, value) in enumerate(
-            [("Substitutions", s["substitutions"]), ("Deletions", s["deletions"]),
-             ("Insertions", s["insertions"])], start=counts_top + 1):
-        ws.cell(row=i, column=data_col, value=name)
-        ws.cell(row=i, column=data_col + 1, value=value)
-
-    cat_top = counts_top + 5
-    ws.cell(row=cat_top, column=data_col, value="WER by category").font = BOLD
-    top_cats = s["categories"][:12]
-    for i, c in enumerate(top_cats, start=cat_top + 1):
-        ws.cell(row=i, column=data_col, value=c["category"])
-        ws.cell(row=i, column=data_col + 1, value=c["wer"])
-
-    # ── charts ────────────────────────────────────────────────────────────
-    chart1 = BarChart()
-    chart1.type = "col"
-    chart1.title = "Error rates (%)"
-    chart1.y_axis.title = "%"
-    chart1.legend = None
-    chart1.height, chart1.width = 7.5, 12
-    chart1.add_data(Reference(ws, min_col=data_col + 1, min_row=5, max_row=8), titles_from_data=False)
-    chart1.set_categories(Reference(ws, min_col=data_col, min_row=5, max_row=8))
-    ws.add_chart(chart1, f"A{metrics_bottom + 3}")
-
-    chart2 = BarChart()
-    chart2.type = "col"
-    chart2.title = "Substitutions, deletions, insertions"
-    chart2.y_axis.title = "words"
-    chart2.legend = None
-    chart2.height, chart2.width = 7.5, 12
-    chart2.add_data(Reference(ws, min_col=data_col + 1, min_row=counts_top + 1,
-                              max_row=counts_top + 3), titles_from_data=False)
-    chart2.set_categories(Reference(ws, min_col=data_col, min_row=counts_top + 1,
-                                    max_row=counts_top + 3))
-    ws.add_chart(chart2, f"F{metrics_bottom + 3}")
-
-    if top_cats:
-        chart3 = BarChart()
-        chart3.type = "bar"              # horizontal: category names stay readable
-        chart3.title = "WER by category (%), worst first"
-        chart3.x_axis.title = "%"
-        chart3.legend = None
-        chart3.height = max(7.5, 1.6 + 0.55 * len(top_cats))
-        chart3.width = 16
-        chart3.add_data(Reference(ws, min_col=data_col + 1, min_row=cat_top + 1,
-                                  max_row=cat_top + len(top_cats)), titles_from_data=False)
-        chart3.set_categories(Reference(ws, min_col=data_col, min_row=cat_top + 1,
-                                        max_row=cat_top + len(top_cats)))
-        ws.add_chart(chart3, f"A{metrics_bottom + 20}")
-
-    # ── category table under the charts ───────────────────────────────────
-    table_row = metrics_bottom + 40
-    ws.cell(row=table_row - 1, column=1, value="WER by category").font = BOLD
-    header(ws, table_row, ["Category", "Samples", "WER %", "Failed"], [26, 12, 12, 12])
-    table_row += 1
-    for c in s["categories"]:
-        ws.cell(row=table_row, column=1, value=c["category"]).font = BODY
-        ws.cell(row=table_row, column=2, value=c["n"]).font = BODY
-        cell = ws.cell(row=table_row, column=3, value=c["wer"])
+    rows_for_chart = [
+        ("Average WER %", s["wer_macro"]),
+        ("Average CER %", s["cer_macro"]),
+        ("Sentence error rate %", s["ser"]),
+        ("Substitutions", s["substitutions"]),
+        ("Deletions", s["deletions"]),
+        ("Insertions", s["insertions"]),
+    ]
+    for i, (name, value) in enumerate(rows_for_chart, start=4):
+        ws.cell(row=i, column=src_label, value=name).font = BODY
+        cell = ws.cell(row=i, column=src_value, value=value)
         cell.font = BODY
-        cell.number_format = "0.00"
-        ws.cell(row=table_row, column=4, value=c["failed"]).font = BODY
-        for col in range(1, 5):
-            ws.cell(row=table_row, column=col).border = BORDER
-        table_row += 1
+        cell.number_format = "0.00" if isinstance(value, float) else "0"
+    top, bottom = 4, 3 + len(rows_for_chart)
+    ws.column_dimensions["R"].width = 24
+    ws.column_dimensions["S"].width = 10
 
-    if s["failure_causes"]:
-        table_row += 2
-        ws.cell(row=table_row - 1, column=1, value="Failures by cause").font = BOLD
-        header(ws, table_row, ["Cause", "Samples"], [52, 12])
-        table_row += 1
-        for cause, n in s["failure_causes"].most_common():
-            ws.cell(row=table_row, column=1, value=str(cause)[:120]).font = BODY
-            ws.cell(row=table_row, column=2, value=n).font = BODY
-            for col in (1, 2):
-                ws.cell(row=table_row, column=col).border = BORDER
-            table_row += 1
+    # One chart. Percentages and word counts share an axis, which is a
+    # compromise: S/D/I are counts, and on a long run they will dwarf the
+    # rates. The exact figures are in the table for when that matters.
+    chart = BarChart()
+    chart.type = "col"
+    chart.title = "Overall WER, CER, SER and S / D / I"
+    chart.legend = None
+    chart.varyColors = True            # a distinct colour per bar
+    chart.dLbls = DataLabelList()
+    chart.dLbls.showVal = True
+    chart.dLbls.showSerName = False
+    chart.dLbls.showCatName = False
+    chart.dLbls.showLegendKey = False
+    # Without these, some Excel versions render the chart with its axes
+    # hidden, which takes the measure names away from under the bars and
+    # leaves six coloured bars meaning nothing.
+    chart.x_axis.delete = False
+    chart.y_axis.delete = False
+    chart.y_axis.title = "percent  /  words"
+    chart.height, chart.width = 11, 20
+    chart.add_data(Reference(ws, min_col=src_value, min_row=top, max_row=bottom),
+                   titles_from_data=False)
+    chart.set_categories(Reference(ws, min_col=src_label, min_row=top, max_row=bottom))
+    ws.add_chart(chart, "F4")
+    ws.column_dimensions["E"].width = 3
 
 
 DETAIL_COLUMNS = [
@@ -313,27 +281,47 @@ DETAIL_COLUMNS = [
 ]
 
 
+BAND_FILL = PatternFill("solid", fgColor="F2F5FA")
+
+
 def write_detail(ws, rows: list[dict]) -> None:
+    """One row per sample, as a bordered table.
+
+    Every cell is bordered and the rows are banded, because this sheet is read
+    across: finding the ASR output that belongs to a given reference in an
+    unruled grid of long text is the sort of thing that gets misread.
+    """
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A2"
     header(ws, 1, [label for _, label, _ in DETAIL_COLUMNS],
            [w for _, _, w in DETAIL_COLUMNS])
+
+    wrap = {"reference", "hypothesis", "app_message"}
+    numeric = {"WER", "CER", "speaker_analysis_s"}
+    integer = {"SER", "substitutions", "deletions", "insertions"}
+
     for i, r in enumerate(rows, start=2):
         for c, (key, _, _) in enumerate(DETAIL_COLUMNS, 1):
             value = r.get(key, "")
-            if key in ("WER", "CER", "speaker_analysis_s"):
+            if key in numeric:
                 value = num(r, key)
-            elif key in ("SER", "substitutions", "deletions", "insertions"):
+            elif key in integer:
                 v = num(r, key)
                 value = int(v) if v is not None else ""
             cell = ws.cell(row=i, column=c, value=value)
             cell.font = BODY
-            cell.alignment = Alignment(vertical="top",
-                                       wrap_text=key in ("reference", "hypothesis",
-                                                         "app_message"))
-            if key in ("WER", "CER"):
+            cell.border = BORDER
+            cell.alignment = Alignment(
+                vertical="top",
+                horizontal="right" if key in numeric | integer else "left",
+                wrap_text=key in wrap)
+            if key in numeric:
                 cell.number_format = "0.00"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(DETAIL_COLUMNS))}{len(rows) + 1}"
+            if i % 2 == 0:
+                cell.fill = BAND_FILL
+
+    last_col = get_column_letter(len(DETAIL_COLUMNS))
+    ws.auto_filter.ref = f"A1:{last_col}{len(rows) + 1}"
 
 
 def build(results: Path, out: Path | None = None) -> Path:
@@ -344,12 +332,23 @@ def build(results: Path, out: Path | None = None) -> Path:
 
     s = summarise(rows)
     meta = run_meta_for(results)
-    out = out or results.with_name(results.stem.replace("results_detailed",
-                                                        "report") + ".xlsx")
+    # One file per exit, never overwritten: the run id says which run it
+    # belongs to, the timestamp says when during that run it was taken. Naming
+    # it after the results CSV meant a resumed run overwrote its own earlier
+    # reports, losing every snapshot but the last.
+    run_id = str(meta.get("run_id") or "").strip()
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    name = f"report_{run_id}_{stamp}.xlsx" if run_id else f"report_{stamp}.xlsx"
+    out = out or results.parent / name
 
     wb = openpyxl.Workbook()
-    write_summary(wb.active, s, meta, results)
-    wb.active.title = "Summary"
+    summary_ws = wb.active
+    # Rename BEFORE the charts are built. openpyxl writes the sheet name into
+    # every chart reference at the moment the Reference is created, so renaming
+    # afterwards leaves each chart pointing at a sheet that no longer exists -
+    # the frames and titles still draw, with no bars in them.
+    summary_ws.title = "Summary"
+    write_summary(summary_ws, s, meta, results)
     write_detail(wb.create_sheet("Per sample"), rows)
     wb.save(out)
     return out
