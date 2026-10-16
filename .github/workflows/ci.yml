@@ -13,21 +13,19 @@ concurrency:
 
 jobs:
   test:
-    name: Tests (Python ${{ matrix.python }})
+    # One version: the one the harness is actually run on. Testing several
+    # catches code that works on one and breaks on another, which matters for
+    # something other people install - this runs on one bench machine, so the
+    # extra jobs would only be noise. The `X | Y` union syntax in the scripts
+    # needs 3.10 or later, so that is the floor if this is ever changed back.
+    name: Tests
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # The oldest version the code supports, and the newest it is run on.
-        # The `X | Y` union syntax used in the scripts needs 3.10 or later.
-        python: ["3.10", "3.12"]
-
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.12"
           cache: pip
 
       - name: Install dependencies
@@ -75,7 +73,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: smoke-run-python-${{ matrix.python }}
+          name: smoke-run-output
           path: ci_output/
           if-no-files-found: ignore
           retention-days: 14
