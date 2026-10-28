@@ -192,7 +192,14 @@ def test_the_report_builds_from_the_results(run_environment):
 
     wb = openpyxl.load_workbook(out)
     assert wb.sheetnames == ["Summary", "Per sample"]
-    assert len(wb["Summary"]._charts) == 1, "the summary chart is missing"
+    # Two: percentages and word counts cannot share an axis, so the rates and
+    # the S/D/I counts are drawn separately.
+    charts = wb["Summary"]._charts
+    assert len(charts) == 2, f"expected both summary charts, found {len(charts)}"
+    rates = next((c for c in charts if c.y_axis.scaling.max == 100), None)
+    assert rates is not None, (
+        "the accuracy chart must be fixed to 0-100, or two reports cannot be "
+        "compared by eye")
     assert wb["Per sample"].max_row == 4          # header plus three samples
 
 
