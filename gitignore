@@ -14,6 +14,12 @@ metadata*.csv
 manifest*.csv
 
 # ── Run output ───────────────────────────────────────────────────────────
+# The whole results folder: a run writes a CSV, a report, a status file and a
+# clock file into it after every sample. None of it belongs in the repository,
+# and listing them one pattern at a time missed new ones as they were added.
+results/
+ci_output/
+*.elapsed.json
 results_detailed*.csv
 full_metrics_*.csv
 batch_results_*.csv
@@ -22,6 +28,7 @@ summary*.json
 smartscribe_asr_eval_*.txt
 batch_*_size*.txt
 status.json
+*.elapsed.json
 status.json.tmp
 stop.request
 run.log
