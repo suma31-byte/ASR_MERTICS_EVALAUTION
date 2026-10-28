@@ -30,6 +30,7 @@ import csv
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -43,10 +44,17 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 HERE = Path(__file__).resolve().parent
-STATUS = HERE / "status.json"
+
+# Results, status and the stop request live in the folder the run writes to.
+# Matching the run matters: a dashboard reading a status file nobody writes
+# shows "idle" through an entire evaluation.
+RESULTS_DIR = Path(os.environ.get("ASR_RESULTS_DIR") or (HERE / "results"))
+if not RESULTS_DIR.exists() and (HERE / "status.json").exists():
+    RESULTS_DIR = HERE                 # older layout, everything beside the scripts
+STATUS = RESULTS_DIR / "status.json"
 RUNNER = HERE / "evaluate_asr.py"
 RUN_LOG = HERE / "run.log"
-STOP_REQUEST = HERE / "stop.request"
+STOP_REQUEST = RESULTS_DIR / "stop.request"
 
 PACKAGE = "com.example.speechtotext"
 ADB = os.environ.get("ADB_PATH", "adb")
@@ -177,13 +185,23 @@ def ble_status(force: bool = False) -> dict:
 
 
 # --------------------------------------------------------------- results ---
+def search_dirs() -> list[Path]:
+    """Where results might be: the results folder, and the older layout where
+    everything sat beside the scripts."""
+    dirs = [RESULTS_DIR]
+    if HERE not in dirs:
+        dirs.append(HERE)
+    return dirs
+
+
 def latest_results() -> Path | None:
-    files = sorted(HERE.glob("results_detailed_*.csv"),
-                   key=lambda p: p.stat().st_mtime, reverse=True)
-    if files:
-        return files[0]
-    legacy = HERE / "results_detailed.csv"
-    return legacy if legacy.exists() else None
+    files: list[Path] = []
+    for folder in search_dirs():
+        files.extend(folder.glob("results_detailed_*.csv"))
+        legacy = folder / "results_detailed.csv"
+        if legacy.exists():
+            files.append(legacy)
+    return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
 
 def read_results() -> list[dict]:
@@ -195,10 +213,24 @@ def read_results() -> list[dict]:
     mtime = path.stat().st_mtime
     if _cache["path"] == path and _cache["mtime"] == mtime:
         return _cache["rows"]
+    # Read a copy, never the live file. On Windows a file held open for
+    # reading blocks the run's save - this dashboard polling every two seconds
+    # was enough to stop a run that had been going for days. The copy is taken
+    # with shutil, which opens the source only briefly, and parsed from there.
+    rows = None
+    tmp = path.with_suffix(".dashboard-read.tmp")
     try:
-        with path.open(encoding="utf-8", newline="") as f:
+        shutil.copyfile(path, tmp)
+        with tmp.open(encoding="utf-8", newline="") as f:
             rows = list(csv.DictReader(f))
     except (OSError, csv.Error):
+        rows = None
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    if rows is None:
         return _cache["rows"]
     _cache.update(path=path, mtime=mtime, rows=rows)
     return rows
@@ -275,9 +307,10 @@ def read_log(lines: int = 500) -> str:
 
 def list_outputs() -> list[dict]:
     files = []
-    for pattern in ("results_detailed_*.csv", "full_metrics_*.csv",
-                    "smartscribe_asr_eval_*.txt", "run_*.json", "summary.json"):
-        for f in HERE.glob(pattern):
+    patterns = ("results_detailed_*.csv", "full_metrics_*.csv", "report_*.xlsx",
+                "smartscribe_asr_eval_*.txt", "summary*.json")
+    for folder, pattern in ((d, p) for d in search_dirs() for p in patterns):
+        for f in folder.glob(pattern):
             st = f.stat()
             files.append({"name": f.name, "size_kb": round(st.st_size / 1024, 1),
                           "modified": time.strftime("%Y-%m-%d %H:%M",
@@ -758,8 +791,14 @@ async function draw(full) {
   set("micChipText", micNow === "ble"
     ? (bleOk ? "BLE connected" : "BLE disconnected") : "Phone mic");
 
-  set("progress", `${p.completed??0} / ${p.total??0}`);
+  // The manifest's own numbering when the run knows it, so this card and the
+  // console line read the same. Falls back to the within-range count.
+  set("progress", (p.row && p.manifest_total)
+    ? `${p.row} / ${p.manifest_total}`
+    : `${p.completed??0} / ${p.total??0}`);
   set("percent", (p.percent ?? 0).toFixed(1) + " %");
+  set("inRange", (p.row && p.manifest_total)
+    ? `${p.completed??0} / ${p.total??0} in this run` : "");
   $("track").style.width = (p.percent||0) + "%";
   set("wer", pct(c.WER));
   set("cer", pct(c.CER));
@@ -851,8 +890,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(text.encode("utf-8"), "text/plain; charset=utf-8")
         elif url.path == "/api/download":
             name = (query.get("name") or [""])[0]
-            target = HERE / Path(name).name          # no directory traversal
-            if not target.exists() or not target.is_file():
+            safe = Path(name).name                   # no directory traversal
+            target = next((folder / safe for folder in search_dirs()
+                           if (folder / safe).is_file()), None)
+            if target is None:
                 return self.send_error(404)
             self._send(target.read_bytes(), "application/octet-stream",
                        {"Content-Disposition": f'attachment; filename="{target.name}"'})

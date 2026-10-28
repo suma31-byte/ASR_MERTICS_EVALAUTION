@@ -209,56 +209,70 @@ def write_summary(ws, s: dict, meta: dict, results: Path) -> None:
             ws.cell(row=row, column=c).border = BORDER
         row += 1
 
-    # ── the chart and the values behind it ────────────────────────────────
+    # ── the charts and the values behind them ─────────────────────────────
+    # Two charts, not one. Rates are percentages and S/D/I are counts: on a
+    # shared axis the 5,290 substitutions flattened a 25.55% bar to a line.
     # The source values sit in columns R and S of this sheet rather than on a
-    # separate tab. Excel will not plot data from a hidden sheet - the first
-    # thing it drops is the category labels under the bars - and a visible
-    # extra tab is clutter. Out at column R they are off-screen and harmless.
+    # separate tab, because Excel will not plot data from a hidden sheet and
+    # the first thing it drops is the category labels under the bars.
     src_label, src_value = 18, 19          # columns R and S
-    ws.cell(row=3, column=src_label, value="Measure").font = BOLD
-    ws.cell(row=3, column=src_value, value="Value").font = BOLD
+    rates = [("Average WER %", s["wer_macro"]),
+             ("Average CER %", s["cer_macro"]),
+             ("Sentence error rate %", s["ser"])]
+    counts = [("Substitutions", s["substitutions"]),
+              ("Deletions", s["deletions"]),
+              ("Insertions", s["insertions"])]
 
-    rows_for_chart = [
-        ("Average WER %", s["wer_macro"]),
-        ("Average CER %", s["cer_macro"]),
-        ("Sentence error rate %", s["ser"]),
-        ("Substitutions", s["substitutions"]),
-        ("Deletions", s["deletions"]),
-        ("Insertions", s["insertions"]),
-    ]
-    for i, (name, value) in enumerate(rows_for_chart, start=4):
-        ws.cell(row=i, column=src_label, value=name).font = BODY
-        cell = ws.cell(row=i, column=src_value, value=value)
-        cell.font = BODY
-        cell.number_format = "0.00" if isinstance(value, float) else "0"
-    top, bottom = 4, 3 + len(rows_for_chart)
+    def block(top: int, title: str, pairs: list) -> tuple[int, int]:
+        cell = ws.cell(row=top, column=src_label, value=title)
+        cell.font = BOLD
+        for i, (name, value) in enumerate(pairs, start=top + 1):
+            ws.cell(row=i, column=src_label, value=name).font = BODY
+            v = ws.cell(row=i, column=src_value, value=value)
+            v.font = BODY
+            v.number_format = "0.00" if isinstance(value, float) else "0"
+        return top + 1, top + len(pairs)
+
+    r_top, r_bot = block(3, "Accuracy", rates)
+    c_top, c_bot = block(r_bot + 2, "Error counts", counts)
     ws.column_dimensions["R"].width = 24
-    ws.column_dimensions["S"].width = 10
+    ws.column_dimensions["S"].width = 12
 
-    # One chart. Percentages and word counts share an axis, which is a
-    # compromise: S/D/I are counts, and on a long run they will dwarf the
-    # rates. The exact figures are in the table for when that matters.
-    chart = BarChart()
-    chart.type = "col"
-    chart.title = "Overall WER, CER, SER and S / D / I"
-    chart.legend = None
-    chart.varyColors = True            # a distinct colour per bar
-    chart.dLbls = DataLabelList()
-    chart.dLbls.showVal = True
-    chart.dLbls.showSerName = False
-    chart.dLbls.showCatName = False
-    chart.dLbls.showLegendKey = False
-    # Without these, some Excel versions render the chart with its axes
-    # hidden, which takes the measure names away from under the bars and
-    # leaves six coloured bars meaning nothing.
-    chart.x_axis.delete = False
-    chart.y_axis.delete = False
-    chart.y_axis.title = "percent  /  words"
-    chart.height, chart.width = 11, 20
-    chart.add_data(Reference(ws, min_col=src_value, min_row=top, max_row=bottom),
-                   titles_from_data=False)
-    chart.set_categories(Reference(ws, min_col=src_label, min_row=top, max_row=bottom))
-    ws.add_chart(chart, "F4")
+    def bar(title: str, top: int, bottom: int, axis_title: str,
+            y_max: float | None = None) -> BarChart:
+        """One series per chart, so a distinct colour per bar carries no
+        meaning on its own - each bar is named below it and labelled with its
+        own value above it."""
+        ch = BarChart()
+        ch.type = "col"
+        ch.title = title
+        ch.legend = None
+        ch.varyColors = True
+        ch.dLbls = DataLabelList()
+        ch.dLbls.showVal = True
+        ch.dLbls.showSerName = False
+        ch.dLbls.showCatName = False
+        ch.dLbls.showLegendKey = False
+        # Without these, some Excel versions hide the axes, which takes the
+        # measure names away from under the bars.
+        ch.x_axis.delete = False
+        ch.y_axis.delete = False
+        ch.y_axis.title = axis_title
+        if y_max is not None:
+            # Fixed 0-100 for the percentages. Letting Excel scale to the data
+            # makes a 25% bar fill the chart on one run and a quarter of it on
+            # the next, so two reports cannot be compared by eye.
+            ch.y_axis.scaling.min = 0
+            ch.y_axis.scaling.max = y_max
+        ch.height, ch.width = 10, 17
+        ch.add_data(Reference(ws, min_col=src_value, min_row=top, max_row=bottom),
+                    titles_from_data=False)
+        ch.set_categories(Reference(ws, min_col=src_label, min_row=top, max_row=bottom))
+        return ch
+
+    ws.add_chart(bar("Accuracy: WER, CER and SER", r_top, r_bot, "percent", 100), "F4")
+    ws.add_chart(bar("Error counts: substitutions, deletions, insertions",
+                     c_top, c_bot, "words"), "F24")
     ws.column_dimensions["E"].width = 3
 
 

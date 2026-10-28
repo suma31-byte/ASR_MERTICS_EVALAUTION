@@ -173,6 +173,19 @@ def _canonicalize_number_words(text: str) -> str:
     return " ".join(out)
 
 
+# Units that get separated from their number by a space in written text. The
+# Whisper normaliser drops a lone "%" as punctuation, so "70 %" becomes "70"
+# while the spoken "seventy percent" becomes "70%" - and a correct transcript
+# is scored as a substitution. Joining them before normalisation fixes it at
+# the source rather than per dataset.
+_SPACED_UNIT_RE = re.compile(r"(\d)\s+(%|percent\b|per\s+cent\b)", re.I)
+
+
+def _join_spaced_units(text: str) -> str:
+    return _SPACED_UNIT_RE.sub(lambda m: m.group(1) + ("%" if m.group(2) == "%"
+                                                       else " " + m.group(2)), text)
+
+
 def normalize(text: str) -> str:
     """Canonical ASR comparison form.
 
@@ -182,7 +195,7 @@ def normalize(text: str) -> str:
     twenty. This normalized text is used consistently for WER, CER, SER and
     S/D/I alignment counts.
     """
-    base = _normalizer(text or "")
+    base = _normalizer(_join_spaced_units(text or ""))
     return _canonicalize_number_words(base)
 
 # ─── Config ──────────────────────────────────────────────────────────────────
@@ -217,6 +230,37 @@ def default_manifest() -> Path:
 
 
 MANIFEST_PATH = default_manifest()
+
+# Where results are written. A "results" folder beside the scripts by default,
+# because a run produces a CSV and a report at every exit and they bury the
+# scripts within a day. ASR_RESULTS_DIR, or --results-dir, moves them somewhere
+# else entirely - worth doing, since an overnight run was once lost when the
+# script folder was deleted, and results beside the code share the code's fate.
+RESULTS_DIR = Path(os.environ.get("ASR_RESULTS_DIR") or (DATASET_DIR / "results"))
+try:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    RESULTS_DIR = DATASET_DIR          # read-only location: stay where we are
+
+# A second copy, refreshed during the run. Not a substitute for a backup
+# system - just a cheap second chance on another drive or a synced folder.
+BACKUP_DIR: Path | None = (Path(os.environ["ASR_BACKUP_DIR"])
+                           if os.environ.get("ASR_BACKUP_DIR") else None)
+BACKUP_EVERY = 25          # samples between mirror copies
+REPORT_EVERY_DEFAULT = 100  # samples between in-progress report snapshots
+REPORT_EVERY = REPORT_EVERY_DEFAULT
+
+UPLOAD_EVERY_DEFAULT = 0    # samples between Firestore uploads; 0 is off
+UPLOAD_EVERY = UPLOAD_EVERY_DEFAULT
+# Progress updates are on by default. They cost one Firestore write every five
+# minutes and need a key to do anything at all, so there is nothing to turn off
+# for anyone not using Firebase - and for anyone who is, a run that only
+# reports at the end is a run nobody can check on. --upload-every-min 0 stops it.
+UPLOAD_EVERY_MIN_DEFAULT = 5.0   # minutes between uploads; 0 is off
+UPLOAD_EVERY_MIN = UPLOAD_EVERY_MIN_DEFAULT
+_last_upload_at = 0.0
+UPLOADER = DATASET_DIR / "upload_results.py"
+_upload_proc: subprocess.Popen | None = None
 CALIBRATION_JSON = DATASET_DIR / "calibration.json"
 SCREENSHOT_PATH = DATASET_DIR / "calibration_screenshot.png"
 
@@ -230,7 +274,7 @@ SUMMARY_JSON = DATASET_DIR / "summary.json"
 
 
 def new_results_csv_path(ts: str) -> Path:
-    return DATASET_DIR / f"results_detailed_{ts}.csv"
+    return RESULTS_DIR / f"results_detailed_{ts}.csv"
 
 
 def new_full_metrics_csv_path(ts: str) -> Path:
@@ -238,11 +282,34 @@ def new_full_metrics_csv_path(ts: str) -> Path:
 
 
 def all_results_csvs() -> list[Path]:
-    candidates = list(DATASET_DIR.glob("results_detailed_*.csv"))
+    candidates = list(RESULTS_DIR.glob("results_detailed_*.csv"))
+    if RESULTS_DIR != DATASET_DIR:
+        candidates += list(DATASET_DIR.glob("results_detailed_*.csv"))
     legacy = DATASET_DIR / "results_detailed.csv"
     if legacy.exists():
         candidates.append(legacy)
     return candidates
+
+
+def results_file_of_last_run() -> Path | None:
+    """The results file the previous run was actually writing to.
+
+    Modification time is not a safe way to find it: a run that is interrupted
+    early leaves a newer file untouched, and the previous run's file looks like
+    the most recent one. The run records its own choice instead.
+    """
+    status = RESULTS_DIR / "status.json"
+    if not status.exists():
+        return None
+    try:
+        meta = json.loads(status.read_text(encoding="utf-8")).get("run_meta") or {}
+    except (OSError, json.JSONDecodeError):
+        return None
+    name = str(meta.get("results_file") or "").strip()
+    if not name:
+        return None
+    candidate = DATASET_DIR / Path(name).name
+    return candidate if candidate.exists() else None
 
 
 def latest_results_csv() -> Path | None:
@@ -1529,13 +1596,13 @@ def append_result(row: dict) -> None:
     existing = load_all_results()
     existing[row["id"]] = row
     tmp = RESULTS_CSV.with_suffix(".csv.tmp")
+    last: OSError | None = None
     try:
         with open(tmp, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=RESULT_FIELDS)
             writer.writeheader()
             for r in existing.values():
                 writer.writerow(r)
-        tmp.replace(RESULTS_CSV)
     except OSError as e:
         try:
             tmp.unlink()
@@ -1546,8 +1613,55 @@ def append_result(row: dict) -> None:
             f"could not write {RESULTS_CSV.name}: {e}"
             + (f" (PC free space {free} MB)" if free is not None else "")) from e
 
+    # On Windows the move fails with "Access is denied" whenever another
+    # program has the file open - Excel holds an exclusive lock on a CSV for as
+    # long as it is open, and a sync client or virus scanner can hold one for a
+    # second or two. Those are transient or fixable, so retry over several
+    # seconds rather than ending a run that has been going for days.
+    for attempt in range(8):
+        try:
+            tmp.replace(RESULTS_CSV)
+            return
+        except PermissionError as e:
+            last = e
+            if attempt == 2:
+                print(f"  (waiting for {RESULTS_CSV.name} - something has it open; "
+                      "close it in Excel if it is open there)")
+            time.sleep(0.4 * (attempt + 1))
+        except OSError as e:
+            last = e
+            break
 
-STATUS_JSON = DATASET_DIR / "status.json"
+    if isinstance(last, PermissionError):
+        # The rename is still blocked. On Windows any process holding the file
+        # open for reading blocks it - the dashboard polls this CSV every two
+        # seconds, which is enough to collide with a save after every sample.
+        # Writing over the file directly does not need the rename, so it works
+        # where the rename does not. The temporary file is kept, not deleted:
+        # if a crash lands mid-write, it holds the same rows.
+        try:
+            with open(RESULTS_CSV, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=RESULT_FIELDS)
+                writer.writeheader()
+                for r in existing.values():
+                    writer.writerow(r)
+            return
+        except OSError as e:
+            last = e
+
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    locked = isinstance(last, PermissionError)
+    raise ResultWriteError(
+        f"could not write {RESULTS_CSV.name}: {last}"
+        + ("\n  Something is holding the file open and will not let go. Close it "
+           "in Excel if it is open there, and close any dashboard window, then "
+           "re-run." if locked else f" (PC free space {pc_free_mb()} MB)"))
+
+
+STATUS_JSON = RESULTS_DIR / "status.json"
 STOP_REQUEST = DATASET_DIR / "stop.request"
 
 
@@ -1583,6 +1697,66 @@ def notify(title: str, message: str) -> None:
     threading.Thread(target=popup, daemon=True).start()
 
 
+# Rows already in the results file that this run is not touching. Progress is
+# counted over the range being run, but the running WER is not: a run started
+# at row 2553 would otherwise report its average from a single sample, as if
+# the 2,539 before it had never been scored.
+METRIC_BASE: list[dict] = []
+
+# Time already spent on this results file by earlier sessions. Elapsed time
+# resets to zero on every resume otherwise, so a run that has taken nineteen
+# hours across four sessions reports half a minute.
+PRIOR_ELAPSED_S = 0.0
+SESSION_SAMPLES = 0        # samples actually run in this session
+
+
+def elapsed_file_for(results: Path) -> Path:
+    """A small file beside the results, holding only the time spent on them."""
+    return results.with_suffix(".elapsed.json")
+
+
+def prior_elapsed_for(results: Path) -> float:
+    """What previous sessions spent on this same results file.
+
+    Kept in its own file, named after the results. status.json was the obvious
+    place and the wrong one: it holds whichever run wrote last, so resuming an
+    older results file read someone else's clock - or zero - and the total
+    started again from nothing.
+    """
+    path = elapsed_file_for(results)
+    if path.exists():
+        try:
+            return float(json.loads(path.read_text(encoding="utf-8"))
+                         .get("elapsed_s") or 0.0)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+    # Nothing recorded yet: fall back to status.json, but only if it is
+    # describing this same results file.
+    if STATUS_JSON.exists():
+        try:
+            data = json.loads(STATUS_JSON.read_text(encoding="utf-8"))
+            if str((data.get("run_meta") or {}).get("results_file") or "") == results.name:
+                return float((data.get("timing") or {}).get("elapsed_s") or 0.0)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return 0.0
+
+
+def save_elapsed(results: Path, elapsed_s: float) -> None:
+    """Written after every sample, so a power cut costs seconds, not hours."""
+    try:
+        elapsed_file_for(results).write_text(
+            json.dumps({"results_file": results.name,
+                        "elapsed_s": round(elapsed_s, 1),
+                        "updated": time.strftime("%Y-%m-%d %H:%M:%S")}),
+            encoding="utf-8")
+    except OSError:
+        pass          # the clock is a convenience; never stop a run for it
+
+# Which slice of the manifest this run covers, so progress can be reported in
+# the dataset's own numbering as well as within the range.
+RUN_RANGE: dict = {"start": 0, "manifest_total": 0, "position": 0}
+
 # Wall-clock time this run began. A stop request written before it belongs to
 # an earlier run and must be ignored, or a single forgotten file stops every
 # run that follows it.
@@ -1601,6 +1775,25 @@ def stop_requested() -> bool:
         print("  (cleared a stop request left over from an earlier run)")
         return False
     return True
+
+
+def mirror_results(results: Path) -> None:
+    """Copy the results to the backup folder, if one was given.
+
+    Done by copy rather than by writing twice: the live file is replaced
+    atomically on every sample, and a second writer in that path is another
+    thing that can fail mid-run. A copy that fails costs nothing.
+    """
+    if BACKUP_DIR is None or not results.exists():
+        return
+    try:
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(results, BACKUP_DIR / results.name)
+        status = RESULTS_DIR / "status.json"
+        if status.exists():
+            shutil.copy2(status, BACKUP_DIR / status.name)
+    except OSError as e:
+        print(f"  (backup copy failed: {e})")
 
 
 def clear_stop_request() -> None:
@@ -1720,19 +1913,18 @@ def launch_dashboard(port: int = DASHBOARD_PORT, force_window: bool = False) -> 
         if port_open(port):
             info = dashboard_info(port)
             if info is not None:
-                # A window that polled a few seconds ago is one that already
-                # exists - opening another every run is how you end up with six
-                # of them. A closed window stops polling, so the gap is short:
-                # long enough to recognise a live window, short enough that a
-                # closed one is noticed on the next run.
-                seen = info.get("viewer_seen_s_ago")
+                # A dashboard is already serving: leave it alone. Judging by
+                # how recently a browser polled was too clever - a window that
+                # is minimised, on another desktop, or just slow to poll looks
+                # closed, and every run added one more window. If the window
+                # really has been closed, --show-dashboard opens one.
                 if force_window:
                     show(port)
-                elif seen is not None and seen < 15:
-                    print(f"  Dashboard is already open at http://127.0.0.1:{port} "
-                          f"(check the taskbar; use --show-dashboard to open another)")
                 else:
-                    show(port)
+                    print(f"  Dashboard is already running at http://127.0.0.1:{port}"
+                          + ("  (check the taskbar; --show-dashboard opens a window)"
+                             if info.get("viewer_seen_s_ago") is None
+                             or info["viewer_seen_s_ago"] > 30 else ""))
                 return
             # something else owns the port; move to the next free one
             for alt in range(requested + 1, requested + 12):
@@ -1792,8 +1984,10 @@ def write_status(state: str, done: list[dict], total: int, current: dict | None,
     """One small file, rewritten after every sample. The dashboard polls this
     and nothing else: it only reads, so it can never slow down or crash a run,
     and whatever finished survives if the run dies."""
-    scored = [r for r in done if r.get("status") == "ok" and (r.get("hypothesis") or "").strip()]
-    failed = [r for r in done if r not in scored]
+    pool = METRIC_BASE + done
+    scored = [r for r in pool if r.get("status") == "ok" and (r.get("hypothesis") or "").strip()]
+    failed = [r for r in done
+              if not (r.get("status") == "ok" and (r.get("hypothesis") or "").strip())]
 
     def avg(key: str) -> float:
         vals = [float(r[key]) for r in scored if str(r.get(key, "")).strip() not in ("", "None")]
@@ -1802,9 +1996,14 @@ def write_status(state: str, done: list[dict], total: int, current: dict | None,
     def total_of(key: str) -> int:
         return int(sum(float(r.get(key) or 0) for r in scored))
 
-    elapsed = time.monotonic() - started_at
-    rate = elapsed / len(done) if done else 0.0
-    remaining = total - len(done)
+    session = time.monotonic() - started_at
+    elapsed = PRIOR_ELAPSED_S + session
+    # Rate from this session only: it is how fast the phone is going now, not
+    # an average across days of stopped and restarted sessions.
+    rate = session / len(done) if done else 0.0
+    manifest_total = RUN_RANGE.get("manifest_total") or total
+    completed = RUN_RANGE.get("position") or len(pool)
+    remaining = max(0, manifest_total - completed)
 
     payload = {
         "state": state,
@@ -1813,9 +2012,18 @@ def write_status(state: str, done: list[dict], total: int, current: dict | None,
         "ble_connected": RUN_META.get("ble_connected"),
         "ble_detail": RUN_META.get("ble_detail", ""),
         "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "progress": {"completed": len(done), "total": total, "remaining": remaining,
-                     "scored": len(scored), "failed": len(failed),
-                     "percent": round(len(done) / total * 100, 1) if total else 0.0},
+        "progress": {"completed": completed, "total": manifest_total,
+                     "remaining": remaining,
+                     "scored": len(scored),
+                     "failed": len(pool) - len(scored),
+                     "rows_in_file": len(pool),
+                     "this_run": len(done), "this_run_total": total,
+                     "percent": round(completed / manifest_total * 100, 1)
+                                if manifest_total else 0.0,
+                     # the same point expressed in the manifest's own numbering,
+                     # so the dashboard and the console read the same
+                     "row": RUN_RANGE.get("position") or None,
+                     "manifest_total": RUN_RANGE.get("manifest_total") or None},
         "cumulative": {
             "WER": avg("WER"), "CER": avg("CER"),
             "SER": round(sum(1 for r in scored if float(r.get("SER") or 0)) / len(scored) * 100, 2)
@@ -1825,6 +2033,7 @@ def write_status(state: str, done: list[dict], total: int, current: dict | None,
             "insertions": total_of("insertions"),
         },
         "timing": {"elapsed_s": round(elapsed, 1),
+                   "session_s": round(session, 1),
                    "avg_per_sample_s": round(rate, 1),
                    "eta_s": round(rate * remaining, 1)},
         "current": current or {},
@@ -1835,13 +2044,39 @@ def write_status(state: str, done: list[dict], total: int, current: dict | None,
                     "status": r.get("status")} for r in done[-10:]],
         "run_meta": RUN_META,
     }
+    # Written to a temporary file and moved into place, so the dashboard never
+    # reads half a file. On Windows that move fails with "Access is denied" if
+    # anything else has the target open for even a moment - the dashboard
+    # reading it, a backup tool, an antivirus scan. It killed a run 4,940
+    # samples in. A status file is a convenience; it must never be able to stop
+    # a measurement, so this retries briefly, then falls back to a plain write,
+    # then gives up quietly.
+    body = json.dumps(payload, indent=2, ensure_ascii=False)
     tmp = STATUS_JSON.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(STATUS_JSON)   # atomic, so the dashboard never reads half a file
+    try:
+        tmp.write_text(body, encoding="utf-8")
+        for attempt in range(4):
+            try:
+                tmp.replace(STATUS_JSON)
+                break
+            except PermissionError:
+                if attempt == 3:
+                    STATUS_JSON.write_text(body, encoding="utf-8")
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+                else:
+                    time.sleep(0.15 * (attempt + 1))
+    except OSError as e:
+        print(f"  (status file not updated: {e})")
+
+    save_elapsed(RESULTS_CSV, elapsed)
 
 
 def print_running(done: list[dict], total: int, started_at: float) -> None:
-    scored = [r for r in done if r.get("status") == "ok" and (r.get("hypothesis") or "").strip()]
+    pool = METRIC_BASE + done
+    scored = [r for r in pool if r.get("status") == "ok" and (r.get("hypothesis") or "").strip()]
     if not scored:
         print(f"  Running   : no scored samples yet ({len(done)}/{total} attempted)")
         return
@@ -1851,13 +2086,28 @@ def print_running(done: list[dict], total: int, started_at: float) -> None:
     sub = int(sum(float(r.get("substitutions") or 0) for r in scored))
     dele = int(sum(float(r.get("deletions") or 0) for r in scored))
     ins = int(sum(float(r.get("insertions") or 0) for r in scored))
-    elapsed = time.monotonic() - started_at
-    rate = elapsed / len(done) if done else 0.0
+    session = time.monotonic() - started_at
+    elapsed = PRIOR_ELAPSED_S + session
+    # Divided by the samples this session actually ran. Dividing by every row
+    # in the range counted 2,554 rows that were finished days ago against a
+    # minute of work, and printed 0.0s per sample.
+    rate = session / SESSION_SAMPLES if SESSION_SAMPLES else 0.0
+    note = f"  (all {len(scored)} scored in {RESULTS_CSV.name})" if METRIC_BASE else ""
     print(f"  Running   : WER={wer:.2f}%  CER={cer:.2f}%  SER={ser:.1f}%  "
-          f"S={sub} D={dele} I={ins}")
-    print(f"  Progress  : {len(done)}/{total} done, {len(done) - len(scored)} failed, "
-          f"{total - len(done)} left  |  {elapsed / 60:.1f} min elapsed, "
-          f"{rate:.1f}s per sample")
+          f"S={sub} D={dele} I={ins}{note}")
+    # Counted over the whole results file against the whole manifest, so this
+    # line and the sample line above it describe the same position. Counting
+    # the range alone read as 18/16790 while the console header said 2554 -
+    # two true numbers that look like a contradiction.
+    manifest_total = RUN_RANGE.get("manifest_total") or total
+    # How far through the manifest we are, not how many rows the file holds.
+    # Re-running a range replaces rows rather than adding them, so a row count
+    # sits still while the run moves - it read 2571 for every sample.
+    completed = RUN_RANGE.get("position") or len(pool)
+    failed = len(pool) - len(scored)
+    print(f"  Progress  : {completed}/{manifest_total} done, {failed} failed, "
+          f"{max(0, manifest_total - completed)} left  |  "
+          f"{elapsed / 60:.1f} min elapsed, {rate:.1f}s per sample")
 
 
 # ─── Per-sample pipeline ─────────────────────────────────────────────────────
@@ -2468,6 +2718,118 @@ def cmd_listen(sample_id: str | None) -> None:
 MAX_CONSECUTIVE_FAILURES = 5
 
 
+def upload_due() -> bool:
+    """Has the upload interval passed? Measured in wall-clock time, so the
+    rate of updates does not change with how slow the samples are."""
+    global _last_upload_at
+    if not UPLOAD_EVERY_MIN:
+        return False
+    now = time.monotonic()
+    if _last_upload_at and now - _last_upload_at < UPLOAD_EVERY_MIN * 60:
+        return False
+    _last_upload_at = now
+    return True
+
+
+def upload_snapshot(results: Path | None, final: bool = False) -> None:
+    """Send what has been scored so far to Firestore, in the background.
+
+    Run as a separate process, not a thread: it is network work in the middle
+    of a measurement, and the only acceptable failure mode is that it fails
+    alone. The run never waits for it, never sees its errors, and the results
+    are already on disk before it starts - so an upload that dies costs
+    nothing but the upload.
+
+    The uploader records what it has sent, so each call is cheap: only samples
+    added since the last one go up.
+    """
+    global _upload_proc
+    if results is None or not Path(results).exists():
+        return
+    # Mid-run uploads are opt-in with --upload-every; the one at the end of a
+    # run is not. Finishing a run and leaving the results only on this machine
+    # is the case this exists to prevent.
+    if not final and not (UPLOAD_EVERY or UPLOAD_EVERY_MIN):
+        return
+    if not UPLOADER.exists():
+        if final and UPLOAD_EVERY:
+            print(f"  (no upload: {UPLOADER.name} is not beside this script)")
+        return
+    if not os.environ.get("FIREBASE_KEY"):
+        if final:
+            print("  (no upload: FIREBASE_KEY is not set)")
+        return
+
+    if _upload_proc is not None and _upload_proc.poll() is None:
+        if not final:
+            return      # a mid-run upload is still going; skip this round
+        try:
+            _upload_proc.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            pass
+
+    try:
+        # A progress update goes to one live document; only an exit leaves a
+        # permanent record. Updating every few minutes with a new document
+        # would leave hundreds of them for a single run.
+        cmd = [sys.executable, str(UPLOADER), "--results", str(results)]
+        if not final:
+            cmd.append("--live")
+        _upload_proc = subprocess.Popen(
+            cmd,
+            cwd=str(DATASET_DIR),
+            stdout=None if final else subprocess.DEVNULL,
+            stderr=None if final else subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL)
+    except OSError as e:
+        print(f"  (could not start the upload: {e})")
+        return
+
+    if final:
+        # The run is ending anyway, so wait and let the uploader report. A
+        # process started and immediately orphaned may never finish its work.
+        print("  Uploading results to Firestore...")
+        try:
+            _upload_proc.wait(timeout=600)
+        except subprocess.TimeoutExpired:
+            print("  (upload still going; it will finish on its own, or run "
+                  "upload_results.py again later)")
+
+
+def finish_run(reason: str, done: list[dict], total: int, started_at: float,
+               state: str = "paused") -> None:
+    """Save, report and upload, then say where it stopped.
+
+    Called from every exit, including an interrupt caught mid-save. Ctrl+C can
+    land anywhere - the earlier version only guarded the sample itself, so an
+    interrupt during the write escaped the loop and the run ended with no
+    report, no upload and the row it was writing lost.
+    """
+    write_status(state, done, total, None, started_at)
+    print(f"\n{reason}")
+    mirror_results(RESULTS_CSV)
+    build_report(RESULTS_CSV)
+    upload_snapshot(RESULTS_CSV, final=True)
+
+
+def build_report_snapshot(results: Path | None) -> None:
+    """A report written during the run, overwritten each time.
+
+    The final report is built when a run ends - and a power cut has no end. A
+    machine that restarts overnight would otherwise leave a results file and
+    nothing anyone can open. One fixed filename, so a long run does not leave
+    two hundred of these behind.
+    """
+    if results is None or not Path(results).exists():
+        return
+    try:
+        import make_report
+        out = Path(results).parent / "report_in_progress.xlsx"
+        make_report.build(Path(results), out)
+    except Exception:
+        pass          # a snapshot is a convenience; never interrupt the run
+
+
 def build_report(results: Path | None) -> None:
     """Write the Excel report for a finished run.
 
@@ -2490,7 +2852,9 @@ def build_report(results: Path | None) -> None:
 def cmd_run(serial: str | None, limit: int | None, start: int,
             manifest: Path | None = None, mic_mode: str | None = None,
             resume: bool = False, conditions: dict | None = None,
-            dashboard: bool = True, force_window: bool = False) -> None:
+            dashboard: bool = True, force_window: bool = False,
+            skip_scored: bool = False, retry_failed: bool = False,
+            elapsed_min: float | None = None) -> None:
     global RESULTS_CSV, RUN_META
     serial = ensure_single_device(serial)
     check_debuggable(serial)
@@ -2527,22 +2891,60 @@ def cmd_run(serial: str | None, limit: int | None, start: int,
     # up where it stopped rather than silently redoing hours of work; starting
     # over is the deliberate choice, with --fresh.
     if resume:
-        previous = latest_results_csv()
+        previous = results_file_of_last_run() or latest_results_csv()
         if previous and previous.exists():
             RESULTS_CSV = previous
             with open(previous, encoding="utf-8") as f:
-                done = list(csv.DictReader(f))
-            already = {r["id"] for r in done if r.get("status") == "ok"
-                       and (r.get("hypothesis") or "").strip()}
-            retry = len(done) - len(already)
-            print(f"Continuing {previous.name}: {len(already)} already scored"
-                  + (f", {retry} failed rows will be retried." if retry else "."))
+                previous_rows = list(csv.DictReader(f))
+            scored_ids = {r["id"] for r in previous_rows if r.get("status") == "ok"
+                          and (r.get("hypothesis") or "").strip()}
+            # Resuming means carrying on from where it stopped. Retrying the
+            # failures as well sends the run back to rows 33 and 132 before it
+            # reaches row 300, which does not look like resuming at all. The
+            # failed rows are still there to redo deliberately, with
+            # --retry-failed or by naming their range with --start.
+            attempted = {r["id"] for r in previous_rows}
+            already = scored_ids if retry_failed else attempted
+            # Progress is counted over the range being run, not over the whole
+            # results file. Seeding `done` with every row the file holds made
+            # the dashboard read 272/19121 while the console was on row 233 -
+            # two different things, both called "completed".
+            in_range = {r["id"] for r in rows}
+            done = [r for r in previous_rows if r.get("id") in in_range]
+            # Everything outside the range still counts toward the averages.
+            METRIC_BASE.clear()
+            METRIC_BASE.extend(r for r in previous_rows if r.get("id") not in in_range)
+            failed_before = len(previous_rows) - len(scored_ids)
+            print(f"Continuing {previous.name}: {len(scored_ids)} already scored"
+                  + (f", {failed_before} failed."
+                     if failed_before else "."))
+            if failed_before and not retry_failed:
+                # Name them. A resumed run that skips past a failed row looks
+                # like it jumped for no reason, and the only way to find out
+                # which rows it passed over was to open the CSV.
+                failed_ids = [r["id"] for r in previous_rows
+                              if r["id"] not in scored_ids]
+                shown = ", ".join(failed_ids[:6])
+                more = f" and {len(failed_ids) - 6} more" if len(failed_ids) > 6 else ""
+                print(f"  ({failed_before} failed rows are skipped: {shown}{more}; "
+                      "--retry-failed redoes them)")
+            elif failed_before:
+                print(f"  (retrying the {failed_before} failed rows)")
             print("  (use --fresh to start a new results file instead)")
         else:
             RESULTS_CSV = new_results_csv_path(ts)
             print(f"No previous run found. Results: {RESULTS_CSV.name}")
     else:
         RESULTS_CSV = new_results_csv_path(ts)
+        # Created now, not at the first saved sample. A fresh run interrupted
+        # before sample one left no file at all, so the next resume picked the
+        # newest file on disk - the previous run - and carried on with that
+        # instead of the empty one just started.
+        try:
+            with open(RESULTS_CSV, "w", newline="", encoding="utf-8") as f:
+                csv.DictWriter(f, fieldnames=RESULT_FIELDS).writeheader()
+        except OSError as e:
+            print(f"  (could not create {RESULTS_CSV.name}: {e})")
         print(f"Starting fresh. Results will be saved to: {RESULTS_CSV.name}")
 
     RUN_META = {
@@ -2555,6 +2957,7 @@ def cmd_run(serial: str | None, limit: int | None, start: int,
         "dataset_rows": len(manifest_all),
         "samples_this_run": len(rows),
         "mic_mode": mic_mode,
+        "results_file": RESULTS_CSV.name,
         "playback_target_dbfs": PLAYBACK_TARGET_DBFS,
         "output_device": PLAYBACK_DEVICE.get("name", ""),
         **(conditions or {}),
@@ -2567,13 +2970,30 @@ def cmd_run(serial: str | None, limit: int | None, start: int,
         print(f"  note: acoustic conditions not recorded ({', '.join(missing)}). "
               "Pass --volume / --distance-cm / --dba so this run can be compared "
               "with others.")
-    print(f"{len(rows)} samples to process.")
+    if start:
+        print(f"{len(rows)} samples to process: rows {start + 1} to {start + len(rows)} "
+              f"of {len(manifest_all)}.")
+    else:
+        print(f"{len(rows)} samples to process.")
 
     pin_output_device()
     stop_reason = check_resources(serial)
     if stop_reason:
         print(f"\nNot starting: {stop_reason}")
         return
+
+    global PRIOR_ELAPSED_S
+    if elapsed_min is not None:
+        # Given on the command line, for a results file whose clock was never
+        # recorded - a run from before the time was tracked, or one whose
+        # record was lost. Saved immediately, so it only needs giving once.
+        PRIOR_ELAPSED_S = max(0.0, elapsed_min) * 60
+        save_elapsed(RESULTS_CSV, PRIOR_ELAPSED_S)
+        print(f"Elapsed time set to {elapsed_min:g} min for {RESULTS_CSV.name}.")
+    else:
+        PRIOR_ELAPSED_S = prior_elapsed_for(RESULTS_CSV) if resume else 0.0
+        if PRIOR_ELAPSED_S:
+            print(f"Earlier sessions on this file: {PRIOR_ELAPSED_S / 60:.1f} min.")
 
     mic_xy = get_mic_xy(serial)
     started_at = time.monotonic()
@@ -2591,6 +3011,19 @@ def cmd_run(serial: str | None, limit: int | None, start: int,
     # something to show the moment the browser opens.
     write_status("running", [], len(rows), None, started_at)
 
+    # Naming a range is an instruction, not a resume: --start 227 means run
+    # from 227, and the results for those rows are rewritten. Skipping them
+    # because an earlier run happened to score them makes the flag do nothing
+    # when it is most likely to be used - re-measuring a stretch after moving
+    # the phone or changing the app. --skip-scored keeps the old behaviour.
+    if start and not skip_scored and already:
+        overlapping = sum(1 for r in rows if r["id"] in already)
+        if overlapping:
+            print(f"  Re-running {overlapping} rows in this range that were already "
+                  "scored; their results will be overwritten. "
+                  "(--skip-scored leaves them alone.)")
+        already = set()
+
     pending = [r for r in rows if r["id"] not in already]
     if not pending:
         print(f"\nAll {len(rows)} requested samples are already scored in "
@@ -2604,11 +3037,22 @@ def cmd_run(serial: str | None, limit: int | None, start: int,
         print(f"{len(rows) - len(pending)} of these were already scored; "
               f"{len(pending)} to do.")
 
+    # Counting from the manifest's own numbering, not from 1. With --start 227
+    # a line reading [5/19116] gives no way to tell which row is being played
+    # or how far through the dataset the run actually is.
+    last_row = start + len(rows)
+    RUN_RANGE.update(start=start, manifest_total=len(manifest_all),
+                     position=start)
+
     processed = 0
     for i, row in enumerate(rows, 1):
+        position = start + i
+        RUN_RANGE["position"] = position
         if row["id"] in already:
             continue
         processed += 1
+        global SESSION_SAMPLES
+        SESSION_SAMPLES = processed
 
         # Stop can be asked for from the dashboard, from another terminal, or
         # by deleting nothing more than a file - so it works regardless of who
@@ -2618,7 +3062,9 @@ def cmd_run(serial: str | None, limit: int | None, start: int,
             write_status("paused", done, len(rows), None, started_at)
             print(f"\nStop requested. {len(done)} samples are saved in "
                   f"{RESULTS_CSV.name}; re-run with --resume to continue.")
+            mirror_results(RESULTS_CSV)
             build_report(RESULTS_CSV)
+            upload_snapshot(RESULTS_CSV, final=True)
             return
 
         # In BLE mode the link is checked before every sample. A microphone
@@ -2633,11 +3079,13 @@ def cmd_run(serial: str | None, limit: int | None, start: int,
                 write_status("stopped_ble_disconnected", done, len(rows), None, started_at)
                 notify("BLE microphone disconnected",
                        f"The BLE microphone is no longer connected.\n\n"
-                       f"Checked before sample {i} of {len(rows)}.\n"
+                       f"Checked before row {position} of {last_row}.\n"
                        f"{detail}\n\n"
                        f"{len(done)} samples are saved in {RESULTS_CSV.name}.\n"
                        f"Reconnect the microphone and re-run with --resume.")
+                mirror_results(RESULTS_CSV)
                 build_report(RESULTS_CSV)
+                upload_snapshot(RESULTS_CSV, final=True)
                 return
             RUN_META["ble_connected"] = True
             RUN_META["ble_detail"] = detail
@@ -2650,70 +3098,95 @@ def cmd_run(serial: str | None, limit: int | None, start: int,
             write_status("paused", done, len(rows), None, started_at)
             notify("Audio output changed",
                    f"{changed}.\n\nThe level calibration no longer applies, so "
-                   f"the run has stopped before sample {i}.\n"
+                   f"the run has stopped before row {position}.\n"
                    f"{len(done)} samples are saved in {RESULTS_CSV.name}.\n"
                    "Restore the output device, then re-run to continue.")
+            mirror_results(RESULTS_CSV)
             build_report(RESULTS_CSV)
+            upload_snapshot(RESULTS_CSV, final=True)
             return
 
         # Battery and free space, every 25 samples: cheap, and all three are
         # slow failures that would otherwise end a long run in the small hours.
-        if processed % 25 == 1 and processed > 1:
+        if processed % BACKUP_EVERY == 1 and processed > 1:
+            mirror_results(RESULTS_CSV)
+        if REPORT_EVERY and processed % REPORT_EVERY == 1 and processed > 1:
+            build_report_snapshot(RESULTS_CSV)
+        if (UPLOAD_EVERY and processed % UPLOAD_EVERY == 1 and processed > 1) \
+                or upload_due():
+            upload_snapshot(RESULTS_CSV)
             stop_reason = check_resources(serial, loud=False)
             if stop_reason:
                 write_status("paused", done, len(rows), None, started_at)
                 notify("Run paused", f"{stop_reason}\n\n"
                        f"{len(done)} samples are saved in {RESULTS_CSV.name}.")
+                mirror_results(RESULTS_CSV)
                 build_report(RESULTS_CSV)
+                upload_snapshot(RESULTS_CSV, final=True)
                 return
 
         tag = row.get("category") or row.get("content_type") or ""
         mic_note = ("BLE mic connected" if mic_mode == "ble" else "phone mic")
-        print(f"\n[{i}/{len(rows)}] id={row['id']} {tag}  |  {mic_note}")
+        print(f"\n[{position}/{last_row}] id={row['id']} {tag}  |  {mic_note}")
         print(f"  REFERENCE: {row['text']}")
         write_status("running", done, len(rows),
-                     {"index": i, "id": row["id"], "reference": row["text"]}, started_at)
+                     {"index": position, "id": row["id"], "reference": row["text"]},
+                     started_at)
+        result = None
         try:
             result = process_sample(row, mic_xy, serial)
-        except KeyboardInterrupt:
-            write_status("paused", done, len(rows), None, started_at)
-            print(f"\nInterrupted. {len(done)} samples are saved in {RESULTS_CSV.name}; "
-                  "re-run with --resume to carry on from here.")
-            build_report(RESULTS_CSV)
-            return
-        except Exception as e:
-            result = blank_result(row, status=f"error:{e}")
 
-        if result.get("status") == "stopped_by_request":
-            clear_stop_request()
-            write_status("paused", done, len(rows), None, started_at)
-            print(f"\nStop requested. {len(done)} samples are saved in "
-                  f"{RESULTS_CSV.name}; re-run to continue from here.")
-            build_report(RESULTS_CSV)
-            return
+            if result.get("status") == "stopped_by_request":
+                clear_stop_request()
+                finish_run(f"Stop requested. {len(done)} samples are saved in "
+                           f"{RESULTS_CSV.name}; re-run to continue from here.",
+                           done, len(rows), started_at)
+                return
 
-        # A hypothesis many times longer than its reference is not a bad
-        # transcription, it is the wrong text. Scoring it would put a four-digit
-        # WER into the averages and poison every figure in the run.
-        ref_words = len(result["reference"].split())
-        hyp_words = len(result["hypothesis"].split())
-        if hyp_words > max(25, MAX_HYP_WORD_RATIO * ref_words):
-            result["app_message"] = (f"transcript was {hyp_words} words for a "
-                                     f"{ref_words}-word reference; not scored")
-            result["status"] = "implausible_transcript"
-            result["hypothesis"] = ""
+            # A hypothesis many times longer than its reference is not a bad
+            # transcription, it is the wrong text. Scoring it would put a
+            # four-digit WER into the averages and poison every figure.
+            ref_words = len(result["reference"].split())
+            hyp_words = len(result["hypothesis"].split())
+            if hyp_words > max(25, MAX_HYP_WORD_RATIO * ref_words):
+                result["app_message"] = (f"transcript was {hyp_words} words for a "
+                                         f"{ref_words}-word reference; not scored")
+                result["status"] = "implausible_transcript"
+                result["hypothesis"] = ""
 
-        full_m = compute_full_metrics(result["reference"], result["hypothesis"])
-        result.update(full_m)
-        try:
+            full_m = compute_full_metrics(result["reference"], result["hypothesis"])
+            result.update(full_m)
             append_result(result)
+        except KeyboardInterrupt:
+            # Save the sample in hand before leaving, if it got far enough to
+            # be scored. An interrupt during the write is why this is here.
+            if result is not None and result.get("WER") is not None:
+                try:
+                    append_result(result)
+                    done = [r for r in done if r.get("id") != result["id"]] + [result]
+                except (ResultWriteError, OSError):
+                    pass
+            finish_run(f"Interrupted. {len(done)} samples are saved in "
+                       f"{RESULTS_CSV.name}; re-run to carry on from here.",
+                       done, len(rows), started_at)
+            return
         except ResultWriteError as e:
             write_status("paused", done, len(rows), None, started_at)
             notify("Results could not be saved",
-                   f"{e}\n\nThe run stopped at sample {i} rather than scoring "
-                   "samples that are not being recorded. Free some space, then "
-                   "re-run to continue.")
+                   f"{e}\n\nThe run stopped at row {position} rather than "
+                   "scoring samples that are not being recorded. Fix the cause "
+                   "above, then re-run to continue from here.")
             return   # no report: the results file itself could not be written
+        except Exception as e:
+            result = blank_result(row, status=f"error:{e}")
+            result.update(compute_full_metrics(result["reference"], ""))
+            try:
+                append_result(result)
+            except (ResultWriteError, OSError):
+                pass
+
+        full_m = {k: result.get(k) for k in
+                  ("WER", "CER", "substitutions", "deletions", "insertions")}
         done = [r for r in done if r.get("id") != result["id"]] + [result]
 
         if result["hypothesis"].strip():
@@ -2730,15 +3203,15 @@ def cmd_run(serial: str | None, limit: int | None, start: int,
             if result.get("wait_s") not in ("", None):
                 timing.append(f"waited {result['wait_s']}s for the session")
             if result.get("speaker_analysis_s") not in ("", None):
-                timing.append(f"{result['speaker_analysis_s']}s in speaker analysis")
+                timing.append(f"{result['speaker_analysis_s']}s waiting for the button")
             note = result.get("app_message") or ""
             print(f"  App output : (none -- status={result['status']})")
             if note:
                 print(f"               app said: {note}")
             if timing:
                 print(f"               {', '.join(timing)}")
-        print(f"  WER={full_m['WER']:.2f}% [{label_wer(full_m['WER'])}]  "
-              f"CER={full_m['CER']:.2f}% [{label_cer(full_m['CER'])}]  "
+        print(f"  WER={float(full_m['WER']):.2f}% [{label_wer(float(full_m['WER']))}]  "
+              f"CER={float(full_m['CER']):.2f}% [{label_cer(float(full_m['CER']))}]  "
               f"S={full_m['substitutions']} D={full_m['deletions']} I={full_m['insertions']}")
         print_running(done, len(rows), started_at)
         write_status("running", done, len(rows), None, started_at)
@@ -2746,11 +3219,10 @@ def cmd_run(serial: str | None, limit: int | None, start: int,
         if result["status"] != "ok" or not result["hypothesis"].strip():
             consecutive_failures += 1
             if consecutive_failures >= 3:
-                write_status("paused", done, len(rows), None, started_at)
-                print("\nThree failures in a row -- pausing. The phone has most likely "
-                      "stopped hearing the speaker, locked, or lost adb.\n"
-                      "Fix it, then re-run with --resume.")
-                build_report(RESULTS_CSV)
+                finish_run("Three failures in a row -- pausing. The phone has most "
+                           "likely stopped hearing the speaker, locked, or lost adb.\n"
+                           "Fix it, then re-run to continue.",
+                           done, len(rows), started_at)
                 return
         else:
             consecutive_failures = 0
@@ -2758,7 +3230,9 @@ def cmd_run(serial: str | None, limit: int | None, start: int,
         time.sleep(INTER_SAMPLE_DELAY_S)
 
     write_status("completed", done, len(rows), None, started_at)
+    mirror_results(RESULTS_CSV)
     build_report(RESULTS_CSV)
+    upload_snapshot(RESULTS_CSV, final=True)
     print(f"\nFinished {processed} samples this run "
           f"({len(done)} in the results file) in "
           f"{(time.monotonic() - started_at) / 60:.1f} min.")
@@ -2793,6 +3267,41 @@ def main() -> None:
                             "most recent one (continuing is the default)")
     p_run.add_argument("--resume", action="store_true",
                        help=argparse.SUPPRESS)   # kept so older commands still work
+    p_run.add_argument("--results-dir", default=None,
+                       help="Where to write results (default: ASR_RESULTS_DIR, "
+                            "else beside the script). Keep this outside the "
+                            "script folder so deleting the folder cannot take "
+                            "the results with it.")
+    p_run.add_argument("--upload-every", type=int, default=UPLOAD_EVERY_DEFAULT,
+                       help="samples between Firestore uploads (0 is off). Needs "
+                            "FIREBASE_KEY set and upload_results.py beside this "
+                            "script. Runs in the background; the evaluation never "
+                            "waits for it and an upload failure cannot stop a run.")
+    p_run.add_argument("--upload-every-min", type=float,
+                       default=UPLOAD_EVERY_MIN_DEFAULT,
+                       help=f"minutes between Firestore progress updates "
+                            f"(default {UPLOAD_EVERY_MIN_DEFAULT:g}, 0 turns them "
+                            "off). Updates one live document with the figures so "
+                            "far; the record written at each exit is separate.")
+    p_run.add_argument("--report-every", type=int, default=REPORT_EVERY_DEFAULT,
+                       help=f"samples between in-progress report snapshots "
+                            f"(default {REPORT_EVERY_DEFAULT}, 0 turns them off). The "
+                            "snapshot survives a power cut; the final report "
+                            "needs the run to finish.")
+    p_run.add_argument("--backup-dir", default=None,
+                       help="Second copy of the results, refreshed every "
+                            f"{BACKUP_EVERY} samples and at every exit")
+    p_run.add_argument("--elapsed-min", type=float, default=None,
+                       help="Seed the elapsed-time clock for this results file, "
+                            "in minutes. Only needed once, for a file whose time "
+                            "was never recorded; after that it accumulates on "
+                            "its own.")
+    p_run.add_argument("--retry-failed", action="store_true",
+                       help="When continuing, also redo rows that failed last "
+                            "time instead of carrying on past them")
+    p_run.add_argument("--skip-scored", action="store_true",
+                       help="With --start, skip rows in the range that are already "
+                            "scored instead of re-running them")
     p_run.add_argument("--volume", default=None, help="PC volume setting, for the run record")
     p_run.add_argument("--distance-cm", default=None, help="Speaker-to-phone distance in cm")
     p_run.add_argument("--dba", default=None, help="Level measured at the phone, in dBA")
@@ -2823,7 +3332,33 @@ def main() -> None:
     elif args.command == "set-mic-xy":
         cmd_set_mic_xy(args.x, args.y)
     elif args.command == "run":
-        global ANALYSIS_MODE
+        global ANALYSIS_MODE, RESULTS_DIR, BACKUP_DIR, STATUS_JSON, STOP_REQUEST
+        global REPORT_EVERY, UPLOAD_EVERY, UPLOAD_EVERY_MIN
+        if getattr(args, "results_dir", None):
+            RESULTS_DIR = Path(args.results_dir)
+            RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            STATUS_JSON = RESULTS_DIR / "status.json"
+            STOP_REQUEST = RESULTS_DIR / "stop.request"
+        if getattr(args, "backup_dir", None):
+            BACKUP_DIR = Path(args.backup_dir)
+        if getattr(args, "report_every", None) is not None:
+            REPORT_EVERY = max(0, args.report_every)
+        if getattr(args, "upload_every_min", None) is not None:
+            UPLOAD_EVERY_MIN = max(0.0, args.upload_every_min)
+        if UPLOAD_EVERY_MIN and os.environ.get("FIREBASE_KEY") and UPLOADER.exists():
+            print(f"  Firestore progress updates every {UPLOAD_EVERY_MIN:g} min.")
+        if getattr(args, "upload_every", None):
+            UPLOAD_EVERY = max(0, args.upload_every)
+            if not os.environ.get("FIREBASE_KEY"):
+                print("  note: --upload-every is set but FIREBASE_KEY is not; "
+                      "nothing will be uploaded.")
+            elif not UPLOADER.exists():
+                print(f"  note: --upload-every is set but {UPLOADER.name} is not "
+                      "beside this script; nothing will be uploaded.")
+            else:
+                print(f"  Uploading to Firestore every {UPLOAD_EVERY} samples.")
+        print(f"Results folder: {RESULTS_DIR}"
+              + (f"   backup: {BACKUP_DIR}" if BACKUP_DIR else ""))
         ANALYSIS_MODE = getattr(args, "analysis", "transcript")
         print(f"Scoring the output of the "
               f"{'TRANSCRIPT' if ANALYSIS_MODE == 'transcript' else 'SPEAKER ANALYSIS'} button.")
@@ -2834,7 +3369,10 @@ def main() -> None:
                             "distance_cm": args.distance_cm,
                             "measured_dba": args.dba},
                 dashboard=not args.no_dashboard,
-                force_window=args.show_dashboard)
+                force_window=args.show_dashboard,
+                skip_scored=args.skip_scored,
+                retry_failed=args.retry_failed,
+                elapsed_min=args.elapsed_min)
     elif args.command == "summarize":
         cmd_summarize(source=Path(args.file) if args.file else None)
     elif args.command == "full-metrics":
